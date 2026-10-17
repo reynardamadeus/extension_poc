@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Connects directly to your Mac to show syntax errors and open them in Xcode.</string>
+	<key>NSHealthShareUsageDescription</key>
+	<string>Used only to keep the app running during coding sessions. No health data is read.</string>
+	<key>NSHealthUpdateUsageDescription</key>
+	<string>Used only to keep the app running during coding sessions. No workout is saved.</string>
+	<key>WKBackgroundModes</key>
+	<array>
+		<string>workout-processing</string>
+	</array>
+	<key>WKRunsIndependentlyOfCompanionApp</key>
+	<true/>
+</dict>
+</plist>

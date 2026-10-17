@@ -1,0 +1,228 @@
+//
+//  WatchBridge.swift
+//  watch Watch App
+//
+//  Talks to the Mac directly over Bluetooth (MacLink). The Mac pushes the
+//  error list whenever it changes; this plays haptics, speaks the change,
+//  and sends "open this error in Xcode" requests.
+//
+
+import AVFoundation
+import Combine
+import Foundation
+import SwiftUI
+import WatchKit
+
+final class WatchBridge: ObservableObject {
+    static let shared = WatchBridge()
+
+    @Published private(set) var snapshot = DiagnosticSnapshot.empty
+    @Published private(set) var status = "Starting…"
+    @Published private(set) var isConnected = false
+    @Published private(set) var hasLoaded = false
+    /// 4-digit code to compare with the Mac while pairing (shown, not spoken).
+    @Published private(set) var pairingCode: String?
+    @Published var selectedIndex = 0
+
+    private let link = MacLink()
+
+    var errors: [WatchDiagnostic] { snapshot.diagnostics }
+
+    var selected: WatchDiagnostic? {
+        errors.indices.contains(selectedIndex) ? errors[selectedIndex] : nil
+    }
+
+    private init() {
+        link.onStatus = { [weak self] text, connected in
+            guard let self else { return }
+            self.status = text
+            if connected != self.isConnected {
+                self.isConnected = connected
+                WKInterfaceDevice.current().play(connected ? .start : .stop)
+            }
+        }
+        link.onPairingCode = { [weak self] code in
+            self?.pairingCode = code
+            if code != nil { WKInterfaceDevice.current().play(.notification) }   // a tap, no speech
+        }
+        link.onSnapshot = { [weak self] snapshot in self?.handle(snapshot) }
+        link.onResult = { [weak self] ok, message in self?.handleOpenResult(ok: ok, message: message) }
+    }
+
+    // MARK: - Connection
+
+    func connect() { link.connect() }
+    func disconnect() { link.disconnect() }
+
+    /// Removes the pairing with the Mac; the next connection pairs again.
+    func forgetMac() {
+        snapshot = .empty
+        hasLoaded = false
+        link.forgetMac()
+    }
+
+    // MARK: - Error list
+
+    /// ONE answer per action:
+    /// ⌘B / ⌘R (build finished)
+    ///   • failed    → failure buzz + "Build failed. N errors. <highlighted error>"
+    ///   • succeeded → success tap + "Build succeeded"
+    /// ⌘S (save, quick syntax check)
+    ///   • all clear now                       → success tap + "No syntax errors" (a click if already clear)
+    ///   • the highlighted error is gone       → success tap
+    ///   • a new error appeared                → failure buzz + that error read aloud
+    ///   • highlighted error needs a build     → "up" tap + "Saved. Press Command B to check."
+    ///   • highlighted error still there       → "retry" tap
+    private func handle(_ new: DiagnosticSnapshot) {
+        let old = snapshot
+        let firstLoad = !hasLoaded
+        let highlighted = selected
+        snapshot = new
+        hasLoaded = true
+
+        let finishedBuild = !firstLoad && new.build != old.build
+        let saved = !firstLoad && new.check != old.check
+        guard firstLoad || finishedBuild || saved || new.diagnostics != old.diagnostics else { return }
+
+        // Keep the highlight on the same problem even if its line number moved.
+        if let highlighted, let index = new.diagnostics.firstIndex(where: { $0.isSameProblem(as: highlighted) }) {
+            selectedIndex = index
+        } else {
+            selectedIndex = min(selectedIndex, max(new.diagnostics.count - 1, 0))
+        }
+        let current = highlighted.flatMap { h in new.diagnostics.first { $0.isSameProblem(as: h) } }
+        let highlightedSolved = highlighted != nil && current == nil
+        let added = new.diagnostics.filter { candidate in
+            !old.diagnostics.contains { $0.isSameProblem(as: candidate) }
+        }
+        let device = WKInterfaceDevice.current()
+
+        if firstLoad {
+            if let first = new.diagnostics.first {
+                device.play(.failure)
+                announce("\(Self.count(new.diagnostics.count)). \(first.spokenSummary)")
+            }
+        } else if finishedBuild {
+            if new.buildFailed {
+                device.play(.failure)
+                announce("Build failed. \(Self.count(new.diagnostics.count)). \(selected?.spokenSummary ?? "")")
+            } else {
+                device.play(.success)
+                announce("Build succeeded")
+            }
+        } else if saved {
+            if new.diagnostics.isEmpty {
+                if old.diagnostics.isEmpty {
+                    device.play(.click)                     // checked, still all clear
+                } else {
+                    device.play(.success)
+                    announce("No syntax errors")
+                }
+            } else if highlightedSolved {
+                device.play(.success)                       // the error you were working on is gone
+            } else if let first = added.first {
+                device.play(.failure)
+                announce("New error. \(first.spokenSummary)")
+            } else if current?.kind == .needsBuild {
+                device.play(.directionUp)                   // can only be confirmed by building
+                announce("Saved. Press Command B to check.")
+            } else {
+                device.play(.retry)                         // still there
+            }
+        } else if let first = added.first {
+            // Errors changed without a save or build (e.g. a held error released): only speak up for new ones.
+            device.play(.failure)
+            announce("New error. \(first.spokenSummary)")
+        }
+    }
+
+    private static func count(_ n: Int) -> String {
+        n == 1 ? "1 error" : "\(n) errors"
+    }
+
+    // MARK: - Navigation
+
+    func move(by step: Int) {
+        guard !errors.isEmpty else { return }
+        selectedIndex = (selectedIndex + step + errors.count) % errors.count
+        WKInterfaceDevice.current().play(.click)
+        readSelected()
+    }
+
+    /// Opens the highlighted error in Xcode on the Mac. The highlight stays on it
+    /// until it's fixed (success tap), then moves to the next error.
+    func openSelected() {
+        guard let target = selected else {
+            WKInterfaceDevice.current().play(.failure)
+            return
+        }
+        guard link.open(generation: snapshot.generation, index: selectedIndex) else {
+            WKInterfaceDevice.current().play(.failure)
+            status = "Not connected to your Mac"
+            return
+        }
+        WKInterfaceDevice.current().play(.click)
+        status = "Opening line \(target.line)…"
+    }
+
+    /// Silent on purpose: the Mac speaks the error after Xcode jumps to it.
+    /// The watch only taps (success / failure).
+    private func handleOpenResult(ok: Bool, message: String) {
+        status = message
+        if ok {
+            WKInterfaceDevice.current().play(.success)
+        } else {
+            WKInterfaceDevice.current().play(.failure)
+        }
+    }
+
+    // MARK: - Speaking errors
+
+    private let speaker = AVSpeechSynthesizer()
+
+    /// "Speak errors aloud" setting (watch ⚙︎ sheet). On by default.
+    private var speakAloud: Bool {
+        UserDefaults.standard.object(forKey: "speakErrors") as? Bool ?? true
+    }
+
+    /// VoiceOver on  → hand the text to VoiceOver (user's own voice and speed).
+    /// VoiceOver off → read it with the speech engine (if "Speak errors aloud" is on).
+    /// Apps can't switch VoiceOver on themselves; that stays the user's choice.
+    func announce(_ text: String) {
+        if WKAccessibilityIsVoiceOverRunning() {
+            AccessibilityNotification.Announcement(text).post()
+        } else if speakAloud {
+            speaker.stopSpeaking(at: .immediate)
+            let utterance = AVSpeechUtterance(string: text)
+            utterance.voice = AVSpeechSynthesisVoice(language: "en-US")   // compiler messages are English
+            speaker.speak(utterance)
+        }
+    }
+
+    /// Double tap: the Mac reads the highlighted error through VoiceOver (same voice as
+    /// the code, when you ask for it). Not connected → the watch reads it instead.
+    func speakSelectedOnMac() {
+        guard selected != nil else {
+            WKInterfaceDevice.current().play(.failure)
+            return
+        }
+        if link.speak(generation: snapshot.generation, index: selectedIndex) {
+            WKInterfaceDevice.current().play(.click)
+        } else {
+            readSelected()
+        }
+    }
+
+    /// Reads the currently selected error on the watch.
+    func readSelected() {
+        guard let error = selected else { announce("No syntax errors"); return }
+        announce("Error \(selectedIndex + 1) of \(errors.count). \(error.spokenSummary)")
+    }
+}
+
+extension WatchDiagnostic {
+    /// Same error even if editing above it moved it to another line.
+    func isSameProblem(as other: WatchDiagnostic) -> Bool {
+        fileName == other.fileName && message == other.message
+    }
+}
