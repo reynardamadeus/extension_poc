@@ -52,6 +52,7 @@
 		F20AE2B5307E8562003B13A0 /* watch Watch App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "watch Watch App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		F20AE2EE307EA069003B13A0 /* extension-poc-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "extension-poc-Info.plist"; sourceTree = "<group>"; };
 		F20AE2EF307EA173003B13A0 /* watch-Watch-App-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "watch-Watch-App-Info.plist"; sourceTree = "<group>"; };
+		F258342B308A09330096D0F2 /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
 		F2E50268307D28BB001F7C2F /* extension_poc.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = extension_poc.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F2E5027C307D2979001F7C2F /* test_extension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = test_extension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F2E5027E307D2979001F7C2F /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = System/Library/Frameworks/Cocoa.framework; sourceTree = SDKROOT; };
@@ -124,6 +125,7 @@
 		F2E5025F307D28BB001F7C2F = {
 			isa = PBXGroup;
 			children = (
+				F258342B308A09330096D0F2 /* .gitignore */,
 				F20AE2EF307EA173003B13A0 /* watch-Watch-App-Info.plist */,
 				F20AE2EE307EA069003B13A0 /* extension-poc-Info.plist */,
 				F2E50290307D2A5C001F7C2F /* shared */,

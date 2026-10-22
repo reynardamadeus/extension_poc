@@ -199,12 +199,15 @@ final class CodeVoiceRunner: NSObject {
         }
 
         let code = sourceLine.trimmingCharacters(in: .whitespacesAndNewlines)
-        let context = findParentContext(in: buffer.lines, startingFrom: lineIndex)
+        // A modifier line (.accessibilityHint after a closure or a call) belongs to the chain's base.
+        let chain = modifierChain(in: buffer.lines, at: lineIndex)
+        let context = findParentContext(in: buffer.lines, startingFrom: chain?.baseLine ?? lineIndex)
         let contextPhrase = context != nil ? "Inside \(context!)." : "At global scope."
+        let chainPhrase = chain.map { " " + $0.spokenBase(currentLine: lineIndex) } ?? ""
 
         let message = code.isEmpty
             ? "\(contextPhrase) Line \(lineIndex + 1). Empty line."
-            : "\(contextPhrase) Line \(lineIndex + 1). Code: \(code)"
+            : "\(contextPhrase) Line \(lineIndex + 1). Code: \(code)\(chainPhrase)"
 
         showInPanel(message, command: "Read Line Context", line: lineIndex + 1)
         speak(message: message)
@@ -228,8 +231,9 @@ final class CodeVoiceRunner: NSObject {
         }
 
         let code = sourceLine.trimmingCharacters(in: .whitespacesAndNewlines)
-        let entity = describeLineEntity(code: code)
-        let context = findParentContext(in: buffer.lines, startingFrom: lineIndex)
+        let chain = modifierChain(in: buffer.lines, at: lineIndex)
+        let entity = chain?.spokenEntity(currentLine: lineIndex) ?? describeLineEntity(code: code)
+        let context = findParentContext(in: buffer.lines, startingFrom: chain?.baseLine ?? lineIndex)
 
         let message: String
         if let context = context {
@@ -260,8 +264,9 @@ final class CodeVoiceRunner: NSObject {
         }
 
         let code = sourceLine.trimmingCharacters(in: .whitespacesAndNewlines)
-        let entity = describeLineEntity(code: code)
-        let context = findParentContext(in: buffer.lines, startingFrom: lineIndex)
+        let chain = modifierChain(in: buffer.lines, at: lineIndex)
+        let entity = chain?.spokenEntity(currentLine: lineIndex) ?? describeLineEntity(code: code)
+        let context = findParentContext(in: buffer.lines, startingFrom: chain?.baseLine ?? lineIndex)
 
         let message: String
         if let context = context {
@@ -582,6 +587,180 @@ final class CodeVoiceRunner: NSObject {
                 }
             }
         }
+    }
+
+    // MARK: - Modifier chains
+    // Handles lines like these, where the line only makes sense with the chain's start:
+    //
+    //     Button("Save") { save() }
+    //         .accessibilityHint("Saves the file")      ← cursor here
+    //     }.accessibilityLabel("Close")                 ← modifier right after a closure
+    //     Text("Hi").font(.title).accessibilityHint("Greeting")   ← chain on one line
+
+    private struct ModifierChain {
+        let base: String          // e.g. Button("Save")
+        let baseLine: Int         // 0-based line where the chain starts
+        let modifiers: [String]   // e.g. accessibilityHint "Saves the file"
+
+        /// Read Line Context: "Chained on Button("Save") from line 5."
+        func spokenBase(currentLine: Int) -> String {
+            baseLine == currentLine
+                ? "Chained on \(base)."
+                : "Chained on \(base) from line \(baseLine + 1)."
+        }
+
+        /// v2 / v3: "modifier accessibilityHint "Saves the file" on Button("Save") from line 5"
+        func spokenEntity(currentLine: Int) -> String {
+            let mods: String
+            switch modifiers.count {
+            case 0: mods = "chain"
+            case 1: mods = "modifier \(modifiers[0])"
+            default: mods = "modifiers " + modifiers.joined(separator: ", then ")
+            }
+            return baseLine == currentLine
+                ? "\(mods) on \(base)"
+                : "\(mods) on \(base) from line \(baseLine + 1)"
+        }
+    }
+
+    /// Finds the top-level `.modifier(...)` calls on this line and the line where their chain starts.
+    /// Returns nil when the line isn't a chain (a normal statement, or `.red` inside a list).
+    private func modifierChain(in lines: NSMutableArray, at lineIndex: Int) -> ModifierChain? {
+        guard lineIndex >= 0, lineIndex < lines.count, let raw = lines[lineIndex] as? String else { return nil }
+        let (modifiers, firstModifierAt) = Self.topLevelModifiers(raw)
+        let chars = Array(raw)
+        guard let first = firstModifierAt else { return nil }
+
+        // The chain starts on this same line: Text("Hi").font(.title)
+        let prefix = String(chars[..<first])
+        var balance = Self.closersMinusOpeners(cleanCodeLine(prefix))
+        let prefixWords = prefix.trimmingCharacters(in: .whitespaces)
+        if balance == 0, prefixWords.contains(where: { $0.isLetter }) {
+            return ModifierChain(base: Self.spokenBase(prefixWords), baseLine: lineIndex, modifiers: modifiers)
+        }
+        guard balance >= 0 else { return nil }
+
+        // Walk up past the closure / call the chain hangs on, and past earlier `.modifier` lines.
+        var index = lineIndex - 1
+        while index >= 0, index >= lineIndex - 300 {
+            let original = lines[index] as? String ?? ""
+            let cleaned = cleanCodeLine(original)
+            balance += Self.closersMinusOpeners(cleaned)
+            if balance < 0 { return nil }        // walked out of the enclosing block: not a chain
+            let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+            if balance == 0, !trimmed.isEmpty, !trimmed.hasPrefix(".") {
+                return ModifierChain(base: Self.spokenBase(original.trimmingCharacters(in: .whitespacesAndNewlines)),
+                                     baseLine: index, modifiers: modifiers)
+            }
+            index -= 1
+        }
+        return nil
+    }
+
+    /// The top-level `.modifier(...)` calls on one line, and where the first one starts.
+    /// `.title` inside `.font(.title)` is an argument, not a modifier, so it's skipped.
+    private static func topLevelModifiers(_ raw: String) -> (modifiers: [String], firstAt: Int?) {
+        let chars = Array(raw)
+        var depth = 0
+        var inString = false
+        var i = 0
+        var modifiers: [String] = []
+        var firstModifierAt: Int?
+
+        while i < chars.count {
+            let c = chars[i]
+            if inString {
+                if c == "\\" { i += 2; continue }
+                if c == "\"" { inString = false }
+                i += 1
+                continue
+            }
+            if c == "/", i + 1 < chars.count, chars[i + 1] == "/" { break }          // comment
+            if c == "\"" { inString = true; i += 1; continue }
+            if "({[".contains(c) {
+                depth += 1
+            } else if ")}]".contains(c) {
+                depth -= 1
+            } else if c == ".", depth <= 0, i + 1 < chars.count,
+                      chars[i + 1].isLetter || chars[i + 1] == "_" {
+                let before = String(chars[..<i]).trimmingCharacters(in: .whitespaces)
+                let startsChain = before.isEmpty || before.hasSuffix(")") || before.hasSuffix("}") || before.hasSuffix("]")
+                if startsChain || firstModifierAt != nil {
+                    var j = i + 1
+                    while j < chars.count, chars[j].isLetter || chars[j].isNumber || chars[j] == "_" { j += 1 }
+                    var spoken = String(chars[(i + 1)..<j])
+                    var k = j
+                    while k < chars.count, chars[k] == " " { k += 1 }
+                    if k < chars.count, chars[k] == "(" {
+                        let argument = bracketContents(chars, openAt: k)
+                        if !argument.isEmpty { spoken += " " + argument }
+                    } else if k < chars.count, chars[k] == "{" {
+                        spoken += " with closure"
+                    }
+                    modifiers.append(spoken)
+                    if firstModifierAt == nil { firstModifierAt = i }
+                    i = j
+                    continue
+                }
+            }
+            i += 1
+        }
+
+        return (modifiers, firstModifierAt)
+    }
+
+    private static func closersMinusOpeners(_ text: String) -> Int {
+        text.reduce(0) { count, c in
+            ")}]".contains(c) ? count + 1 : ("({[".contains(c) ? count - 1 : count)
+        }
+    }
+
+    /// The text inside the parentheses that start at `start` (strings kept), shortened for speech.
+    private static func bracketContents(_ chars: [Character], openAt start: Int) -> String {
+        var depth = 0
+        var inString = false
+        var i = start
+        var inner: [Character] = []
+        while i < chars.count {
+            let c = chars[i]
+            if inString {
+                if c == "\\", i + 1 < chars.count {
+                    inner.append(c); inner.append(chars[i + 1]); i += 2
+                    continue
+                }
+                if c == "\"" { inString = false }
+            } else if c == "\"" {
+                inString = true
+            } else if c == "(" {
+                depth += 1
+                if depth == 1 { i += 1; continue }
+            } else if c == ")" {
+                depth -= 1
+                if depth == 0 { break }
+            }
+            inner.append(c)
+            i += 1
+        }
+        var text = String(inner).trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.count > 60 { text = String(text.prefix(60)) + "…" }
+        return text
+    }
+
+    /// The chain's start as it's spoken: up to its opening brace, e.g. Button("Save").
+    private static func spokenBase(_ text: String) -> String {
+        var result = ""
+        var inString = false
+        var previous: Character?
+        for c in text {
+            if c == "\"" && previous != "\\" { inString.toggle() }
+            if c == "{" && !inString { break }
+            result.append(c)
+            previous = c
+        }
+        var base = result.trimmingCharacters(in: .whitespaces)
+        if base.hasPrefix("return ") { base.removeFirst(7) }
+        if base.count > 60 { base = String(base.prefix(60)) + "…" }
+        return base.isEmpty ? "the expression above" : base
     }
 
     // MARK: - Structural Code Analysis Helpers

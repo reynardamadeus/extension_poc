@@ -1,0 +1,169 @@
+# XcodeGen spec for extension_poc
+#
+#   brew install xcodegen
+#   xcodegen generate          # run in this folder; rewrites extension_poc.xcodeproj
+#
+# Targets
+#   extension_poc     macOS companion app (Watch Relay, Commands tab, Line Context panel).
+#                     Embeds the Xcode extension.
+#   test_extension    Xcode Source Editor extension (CodeVoice, Show Lines in Panel,
+#                     Open Block, Jump to Error Line). Always sandboxed (Apple requires it).
+#   watch Watch App   Watch-only app talking to the Mac over Bluetooth.
+#
+# `shared/` is compiled into all three targets.
+
+name: extension_poc
+
+options:
+  deploymentTarget:
+    macOS: "26.6"
+    watchOS: "11.6"
+  developmentLanguage: en
+  createIntermediateGroups: true
+  fileTypes:
+    entitlements:
+      buildPhase: none
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: CWW22WYZK6
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    SWIFT_APPROACHABLE_CONCURRENCY: YES
+    SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY: YES
+    SWIFT_EMIT_LOC_STRINGS: YES
+    STRING_CATALOG_GENERATE_SYMBOLS: YES
+    LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+    ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    CLANG_CXX_LANGUAGE_STANDARD: gnu++20
+    GCC_C_LANGUAGE_STANDARD: gnu17
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+# Files shown in the navigator but not built into any target.
+fileGroups:
+  - TestSamples
+  - Tools
+  - extension-poc-Info.plist
+  - watch-Watch-App-Info.plist
+
+targets:
+  extension_poc:
+    type: application
+    platform: macOS
+    sources:
+      - path: extension_poc
+      - path: shared
+    dependencies:
+      - target: test_extension          # embedded in Contents/PlugIns
+    settings:
+      base:
+        PRODUCT_NAME: $(TARGET_NAME)
+        PRODUCT_BUNDLE_IDENTIFIER: project.extension-poc
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_FILE: extension-poc-Info.plist
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Connects to your Mac to read syntax errors
+        CODE_SIGN_ENTITLEMENTS: extension_poc/extension_poc.entitlements
+        # Research build: sandbox off (live checking, xed jumps).
+        # For the App Store build set this to YES (see "App Store-safe mode").
+        ENABLE_APP_SANDBOX: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        REGISTER_APP_GROUPS: YES
+        ENABLE_PREVIEWS: YES
+        COMBINE_HIDPI_IMAGES: YES
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        LD_RUNPATH_SEARCH_PATHS: ["$(inherited)", "@executable_path/../Frameworks"]
+
+  test_extension:
+    type: xcode-extension
+    platform: macOS
+    sources:
+      - path: test_extension            # Info.plist is never added to a build phase
+      - path: shared
+    dependencies:
+      - sdk: Cocoa.framework
+      - sdk: Library/Frameworks/XcodeKit.framework
+        root: DEVELOPER_DIR
+        embed: true                     # "Embed & Sign": the extension won't load without it
+        codeSign: true
+    settings:
+      base:
+        PRODUCT_NAME: $(TARGET_NAME)
+        PRODUCT_BUNDLE_IDENTIFIER: project.extension-poc.test-extension
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_FILE: test_extension/Info.plist
+        INFOPLIST_KEY_CFBundleDisplayName: test_extension
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        CODE_SIGN_ENTITLEMENTS: test_extension/test_extension.entitlements
+        ENABLE_APP_SANDBOX: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        REGISTER_APP_GROUPS: YES
+        COMBINE_HIDPI_IMAGES: YES
+        SKIP_INSTALL: YES
+        # No MainActor default here: XcodeKit calls the extension off the main thread.
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+          - "@executable_path/../../../../Frameworks"
+
+  watch Watch App:
+    type: application
+    platform: watchOS
+    sources:
+      - path: watch Watch App
+      - path: shared
+    settings:
+      base:
+        PRODUCT_NAME: $(TARGET_NAME)
+        PRODUCT_BUNDLE_IDENTIFIER: project.watch.watchkitapp
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_FILE: watch-Watch-App-Info.plist
+        INFOPLIST_KEY_CFBundleDisplayName: watch
+        INFOPLIST_KEY_WKWatchOnly: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown
+        TARGETED_DEVICE_FAMILY: "4"
+        SKIP_INSTALL: YES
+        ENABLE_PREVIEWS: YES
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        LD_RUNPATH_SEARCH_PATHS: ["$(inherited)", "@executable_path/Frameworks"]
+      configs:
+        Release:
+          VALIDATE_PRODUCT: YES
+
+schemes:
+  extension_poc:
+    build:
+      targets:
+        extension_poc: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+
+  # Run this one to test the extension: Xcode asks which app to launch — pick Xcode.
+  test_extension:
+    build:
+      targets:
+        extension_poc: all
+        test_extension: all
+    run:
+      config: Debug
+      executable: test_extension
+      askForAppToLaunch: true
+      launchAutomaticallySubstyle: "2"
+      macroExpansion: extension_poc
+
+  watch Watch App:
+    build:
+      targets:
+        watch Watch App: all
+    run:
+      config: Debug
+    archive:
+      config: Release
