@@ -16,9 +16,9 @@ import Foundation
 nonisolated enum BuildLogReader {
 
     /// DerivedData folders belonging to projects inside `projectFolder`.
-    static func derivedDataFolders(for projectFolder: URL) -> [URL] {
-        let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Developer/Xcode/DerivedData")
+    /// - derivedData: Xcode's DerivedData folder (granted by the user in the sandbox).
+    static func derivedDataFolders(for projectFolder: URL, in derivedData: URL) -> [URL] {
+        let root = derivedData
         guard let folders = try? FileManager.default.contentsOfDirectory(
             at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return [] }
         let projectPath = projectFolder.standardizedFileURL.path
@@ -30,9 +30,9 @@ nonisolated enum BuildLogReader {
     }
 
     /// The newest build log for the project, with its modification date.
-    static func latestBuildLog(for projectFolder: URL) -> (url: URL, date: Date)? {
+    static func latestBuildLog(for projectFolder: URL, in derivedData: URL) -> (url: URL, date: Date)? {
         var newest: (url: URL, date: Date)?
-        for folder in derivedDataFolders(for: projectFolder) {
+        for folder in derivedDataFolders(for: projectFolder, in: derivedData) {
             let logs = folder.appendingPathComponent("Logs/Build")
             let files = (try? FileManager.default.contentsOfDirectory(
                 at: logs, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
@@ -47,16 +47,9 @@ nonisolated enum BuildLogReader {
 
     /// All Swift errors in a build log. Nil if the log couldn't be read.
     static func errors(in log: URL) -> [WatchDiagnostic]? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
-        process.arguments = ["-dc", log.path]
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return nil }
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
+        // Unzipped in-process: sandboxed apps can't run /usr/bin/gzip.
+        guard let compressed = try? Data(contentsOf: log),
+              let data = SandboxSupport.gunzip(compressed) else { return nil }
 
         let text = String(decoding: data, as: UTF8.self)
         let pattern = #"(/[^\r\n"]+?\.swift):(\d+):(\d+): error: ([^\r\n]+)"#
@@ -80,9 +73,9 @@ nonisolated enum BuildLogReader {
     /// When Xcode last touched its build database. This changes as soon as a
     /// build STARTS (the log only appears when it ends), so a save followed by
     /// this changing means "⌘B / ⌘R in progress".
-    static func lastBuildActivity(for projectFolder: URL) -> Date? {
+    static func lastBuildActivity(for projectFolder: URL, in derivedData: URL) -> Date? {
         var newest: Date?
-        for folder in derivedDataFolders(for: projectFolder) {
+        for folder in derivedDataFolders(for: projectFolder, in: derivedData) {
             let buildData = folder.appendingPathComponent("Build/Intermediates.noindex/XCBuildData")
             let items = (try? FileManager.default.contentsOfDirectory(
                 at: buildData, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []

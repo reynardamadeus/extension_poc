@@ -37,6 +37,9 @@ nonisolated struct DiagnosticSnapshot: Codable, Equatable, Sendable {
     /// Goes up by one every time a saved file was re-checked (⌘S, or the save before ⌘B / ⌘R),
     /// even if the errors didn't change, so the watch can say "still there".
     var check: Int = 0
+    /// Goes up when live checking sees you LEAVE a line that's still broken
+    /// (or a new error appears away from the cursor): a gentle tap, no speech.
+    var liveTap: Int = 0
 
     static let empty = DiagnosticSnapshot(generation: 0, projectName: "", diagnostics: [])
 }
@@ -117,6 +120,7 @@ nonisolated struct CompactSnapshot: Codable, Sendable {
     var b: Int          // build number
     var bf: Bool        // last build failed
     var c: Int          // check (save) number
+    var t: Int          // live tap number
 
     init(_ snapshot: DiagnosticSnapshot) {
         g = snapshot.generation
@@ -124,6 +128,7 @@ nonisolated struct CompactSnapshot: Codable, Sendable {
         b = snapshot.build
         bf = snapshot.buildFailed
         c = snapshot.check
+        t = snapshot.liveTap
         e = snapshot.diagnostics.prefix(30).map {
             Entry(f: $0.fileName, l: $0.line, m: String($0.message.prefix(140)), k: $0.kind.rawValue)
         }
@@ -133,7 +138,7 @@ nonisolated struct CompactSnapshot: Codable, Sendable {
         DiagnosticSnapshot(generation: g, projectName: p, diagnostics: e.map {
             WatchDiagnostic(path: $0.f, line: $0.l, column: 0, message: $0.m,
                             kind: WatchDiagnostic.Kind(rawValue: $0.k) ?? .syntax)
-        }, build: b, buildFailed: bf, check: c)
+        }, build: b, buildFailed: bf, check: c, liveTap: t)
     }
 }
 

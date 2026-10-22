@@ -7,6 +7,7 @@
 
 import AppKit
 import AVFoundation
+import Carbon.HIToolbox
 import Combine
 import SwiftUI
 import SystemConfiguration
@@ -65,6 +66,101 @@ final class RelayModel: ObservableObject {
     /// A log is read only once its date stops changing (Xcode may still be writing it).
     private var pendingLog: (url: URL, date: Date)?
     @Published private(set) var buildDescription = "No build yet"
+
+    // MARK: Live checking (reads Xcode's editor through the Accessibility API while you type)
+    private var liveText = ""
+    private var liveTextChangedAt = Date.distantPast
+    private var liveCheckedText = ""
+    private var livePath: String?
+    private var liveMatchedText = ""
+    private var liveCursorLine = 0
+    /// All syntax errors in the unsaved editor text.
+    private var liveErrors: [WatchDiagnostic] = []
+    /// After the quiet filters (not the cursor's line, not a block you're still writing).
+    private var liveReportable: [WatchDiagnostic] = []
+    private var liveReportedKeys = Set<String>()
+    private var liveFirstCheck = true
+    /// Right after ⌘S / a build: show everything until you type again.
+    private var liveShowAll = false
+    private var liveTapNumber = 0
+    private var liveChecking = false
+    private var liveTask: Task<Void, Never>?
+    @Published private(set) var accessibilityGranted = LiveEditorMonitor.isTrusted
+    @Published private(set) var liveStatus = "Off"
+    /// "Build only" (default, App Store-safe): every answer comes from ⌘B / ⌘R.
+    /// "Full": also checks on save and while typing (needs the sandbox off).
+    enum CheckMode: String, CaseIterable, Identifiable {
+        case buildOnly, full
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .buildOnly: return "Build only (⌘B / ⌘R)"
+            case .full: return "Full (typing + save + build)"
+            }
+        }
+    }
+    var checkMode: CheckMode {
+        if appStoreMode { return .buildOnly }            // the sandbox allows build checks only
+        return CheckMode(rawValue: UserDefaults.standard.string(forKey: "checkMode") ?? "") ?? .buildOnly
+    }
+
+    // MARK: App Store-safe mode (only what the App Sandbox allows)
+    /// On by default. Forced on when the app really runs in the sandbox.
+    var appStoreMode: Bool {
+        SandboxSupport.isSandboxed || (UserDefaults.standard.object(forKey: "appStoreMode") as? Bool ?? true)
+    }
+    var isSandboxed: Bool { SandboxSupport.isSandboxed }
+    /// Xcode's DerivedData folder (build logs). In the sandbox the user must pick it once.
+    private var derivedDataRoot: URL? = SandboxSupport.resolveBookmark(key: "derivedDataBookmark")
+    var derivedDataDescription: String {
+        if let derivedDataRoot { return derivedDataRoot.path }
+        return isSandboxed ? "Not allowed yet: build results can't be read"
+                           : "\(SandboxSupport.defaultDerivedData.path) (default)"
+    }
+    /// The folder to read build logs from right now (nil = not allowed in the sandbox yet).
+    private var buildLogRoot: URL? {
+        derivedDataRoot ?? (isSandboxed ? nil : SandboxSupport.defaultDerivedData)
+    }
+    private let hotKeys = HotKeyCenter()
+    private var buildOnly: Bool { checkMode == .buildOnly }
+    private var liveEnabled: Bool {
+        !buildOnly && (UserDefaults.standard.object(forKey: "liveChecking") as? Bool ?? true)
+    }
+    private var lineLeaveTap: Bool { UserDefaults.standard.object(forKey: "lineLeaveTap") as? Bool ?? true }
+
+    // MARK: Feedback route: Apple Watch, or one-ear sounds on the Mac
+    enum FeedbackMode: String, CaseIterable, Identifiable {
+        case automatic, watch, mac
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .automatic: return "Automatic (watch when connected)"
+            case .watch: return "Apple Watch only"
+            case .mac: return "Mac sounds only (no watch)"
+            }
+        }
+    }
+    let audio = SpatialAudio()
+    /// The error you're working on when there's no watch (last one jumped to / spoken).
+    private var macHighlighted: WatchDiagnostic?
+    private var hotkeysTrusted = false
+    @Published private(set) var feedbackRoute = "…"
+    var feedbackMode: FeedbackMode {
+        FeedbackMode(rawValue: UserDefaults.standard.string(forKey: "feedbackMode") ?? "") ?? .automatic
+    }
+    private var oneEarVoice: Bool { UserDefaults.standard.object(forKey: "oneEarVoice") as? Bool ?? true }
+    private var autoSpeakMacSounds: Bool { UserDefaults.standard.object(forKey: "autoSpeakMacSounds") as? Bool ?? true }
+    private var currentEar: SpatialAudio.Ear {
+        SpatialAudio.Ear(rawValue: UserDefaults.standard.string(forKey: "ear") ?? "") ?? .left
+    }
+    /// True when feedback goes to the watch; false → Mac plays one-ear sounds.
+    var usingWatch: Bool {
+        switch feedbackMode {
+        case .watch: return true
+        case .mac: return false
+        case .automatic: return bluetooth.verifiedWatchCount > 0
+        }
+    }
     private var server: RelayServer?
     private let bluetooth = BLERelay()
     private var scanTask: Task<Void, Never>?
@@ -84,15 +180,23 @@ final class RelayModel: ObservableObject {
             defaults.set(code, forKey: Key.code)
             pairingCode = code
         }
-        if let path = defaults.string(forKey: Key.folder) {
-            folder = URL(fileURLWithPath: path)
+        if let saved = SandboxSupport.resolveBookmark(key: "folderBookmark") {
+            folder = saved
+        } else if !SandboxSupport.isSandboxed, let path = defaults.string(forKey: Key.folder) {
+            folder = URL(fileURLWithPath: path)              // older builds stored a plain path
         }
     }
 
     // MARK: - Lifecycle
 
     func start() {
-        guard server == nil else { return }
+        guard server == nil, scanTask == nil else { return }
+        if !appStoreMode { startIPhoneRelayServer() }
+        startWatchAndChecks()
+    }
+
+    /// Old iPhone relay (Wi-Fi). Not used in App Store-safe mode.
+    private func startIPhoneRelayServer() {
         let server = RelayServer(
             handler: { [weak self] request in
                 self?.handle(request) ?? .error(503, "Unavailable")
@@ -102,7 +206,9 @@ final class RelayModel: ObservableObject {
             })
         server.start(port: port, advertisedHost: Self.localHostName)
         self.server = server
+    }
 
+    private func startWatchAndChecks() {
         // Direct Bluetooth link to the watch (no iPhone needed).
         bluetooth.onStatus = { [weak self] status in self?.bluetoothStatus = status }
         bluetooth.currentSnapshot = { [weak self] in self?.snapshot ?? .empty }
@@ -122,6 +228,14 @@ final class RelayModel: ObservableObject {
         }
         bluetooth.start()
 
+        installHotkeys()
+        liveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.liveTick()
+                try? await Task.sleep(for: .seconds(0.5))
+            }
+        }
+
         scanTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.scan()
@@ -133,6 +247,24 @@ final class RelayModel: ObservableObject {
         }
     }
 
+    /// In the sandbox the app can't see DerivedData until the user picks it once.
+    func chooseDerivedData() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = SandboxSupport.defaultDerivedData
+        panel.message = "Choose Xcode's DerivedData folder so build results (⌘B / ⌘R) can be read"
+        panel.prompt = "Allow"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        SandboxSupport.saveBookmark(for: url, key: "derivedDataBookmark")
+        _ = url.startAccessingSecurityScopedResource()
+        derivedDataRoot = url
+        processedLogDate = nil
+        pendingLog = nil
+        objectWillChange.send()
+    }
+
     func chooseFolder() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -141,6 +273,7 @@ final class RelayModel: ObservableObject {
         panel.message = "Choose the project folder to watch for syntax errors"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         folder = url
+        SandboxSupport.saveBookmark(for: url, key: "folderBookmark")
         UserDefaults.standard.set(url.path, forKey: Key.folder)
         stamps = [:]
         errorsByFile = [:]
@@ -166,13 +299,14 @@ final class RelayModel: ObservableObject {
         defer { isScanning = false }
 
         let devDir = self.developerDir
+        let syntaxCheck = !buildOnly                 // build-only mode: no checks on save
         let current = await Task.detached { SwiftSyntaxChecker.swiftFiles(in: folder) }.value
         let changed = current.filter { stamps[$0.key] != $0.value }.map(\.key)
         let removed = Set(stamps.keys).subtracting(current.keys)
         guard !changed.isEmpty || !removed.isEmpty else { return }
 
         let (results, newContents) = await Task.detached {
-            (SwiftSyntaxChecker.check(files: changed, developerDir: devDir),
+            (syntaxCheck ? SwiftSyntaxChecker.check(files: changed, developerDir: devDir) : [:],
              Dictionary(uniqueKeysWithValues: changed.compactMap { path in
                  EditTracker.readLines(path).map { (path, $0) }
              }))
@@ -188,8 +322,14 @@ final class RelayModel: ObservableObject {
             contents[path] = lines
         }
         for path in removed { errorsByFile[path] = nil; contents[path] = nil }
-        if !stamps.isEmpty { pendingSave = Date() }   // a save happened (not the very first scan)
-        for (path, errors) in results { errorsByFile[path] = errors.isEmpty ? nil : errors }
+        // File dates are still tracked in build-only mode: a file saved after the last
+        // build marks its build errors "press ⌘B to re-check".
+        if syntaxCheck {
+            if !stamps.isEmpty { pendingSave = Date() }   // a save happened (not the very first scan)
+            for (path, errors) in results { errorsByFile[path] = errors.isEmpty ? nil : errors }
+        } else {
+            errorsByFile = [:]
+        }
         stamps = current
         publish()
     }
@@ -197,7 +337,11 @@ final class RelayModel: ObservableObject {
     /// Picks up a finished Xcode build and loads all its errors.
     func checkBuildLog() async {
         guard let folder else { return }
-        let latest = await Task.detached { BuildLogReader.latestBuildLog(for: folder) }.value
+        guard let root = buildLogRoot else {
+            buildDescription = "Allow access to DerivedData to read build results"
+            return
+        }
+        let latest = await Task.detached { BuildLogReader.latestBuildLog(for: folder, in: root) }.value
         guard let latest, latest.date != processedLogDate else { return }
         // Wait one round until the log stops changing.
         guard let pending = pendingLog, pending.url == latest.url, pending.date == latest.date else {
@@ -218,6 +362,8 @@ final class RelayModel: ObservableObject {
             activeEdit = nil                         // ⌘B / ⌘R means "show me everything now"
             pendingSave = nil                        // the build result answers the save before it
             awaitingBuildSince = nil
+            liveShowAll = true
+            updateLiveReportable(countTap: false)
         }
         let time = latest.date.formatted(date: .omitted, time: .shortened)
         buildDescription = errors.isEmpty
@@ -227,6 +373,11 @@ final class RelayModel: ObservableObject {
 
     /// Decides how to answer a save: wait for the build (⌘B / ⌘R) or answer now (⌘S).
     func resolvePendingSave() async {
+        if buildOnly {                            // saves are never answered in build-only mode
+            pendingSave = nil
+            awaitingBuildSince = nil
+            return
+        }
         guard let saveAt = pendingSave, let folder else { return }
         let now = Date()
         if let since = awaitingBuildSince {
@@ -239,11 +390,14 @@ final class RelayModel: ObservableObject {
             return
         }
         guard now.timeIntervalSince(saveAt) >= 2 else { return }   // give Xcode time to start a build
-        let activity = await Task.detached { BuildLogReader.lastBuildActivity(for: folder) }.value
+        let root = buildLogRoot
+        let activity = await Task.detached { root.flatMap { BuildLogReader.lastBuildActivity(for: folder, in: $0) } }.value
         if let activity, activity >= saveAt.addingTimeInterval(-1) {
             awaitingBuildSince = saveAt            // a build is running: its result will answer
         } else {
             pendingSave = nil                      // plain ⌘S: answer now
+            liveShowAll = true                     // you asked: include the line you're on
+            updateLiveReportable(countTap: false)
             checkNumber += 1
         }
     }
@@ -268,7 +422,10 @@ final class RelayModel: ObservableObject {
         // While a save is still being answered, send nothing (avoids double answers).
         guard pendingSave == nil else { return }
         let now = Date()
-        let liveErrors = errorsByFile.values.flatMap { $0 }
+        // For the file open in Xcode, live (unsaved) errors are newer than the saved ones.
+        let liveActive = liveEnabled && livePath != nil && !liveCheckedText.isEmpty && liveText == liveCheckedText
+        var liveErrors = buildOnly ? [] : errorsByFile.filter { !(liveActive && $0.key == livePath) }.values.flatMap { $0 }
+        if liveActive { liveErrors += liveReportable }
         // Only live (syntax) errors outside the area being edited go to the watch.
         // Editing somewhere else, the hold limit, or ⌘B / ⌘R releases them.
         let shownLive = liveErrors.filter { !isHeld($0, now: now) }
@@ -298,11 +455,208 @@ final class RelayModel: ObservableObject {
         }
         let name = folder?.lastPathComponent ?? ""
         shownKeys = Set(all.map(Self.key))
-        guard all != snapshot.diagnostics || name != snapshot.projectName
-                || buildNumber != snapshot.build || checkNumber != snapshot.check else { return }
+        updateRouteDescription()
+        guard all != snapshot.diagnostics || name != snapshot.projectName || buildNumber != snapshot.build
+                || checkNumber != snapshot.check || liveTapNumber != snapshot.liveTap else { return }
+        let previous = snapshot
         snapshot = DiagnosticSnapshot(generation: snapshot.generation + 1, projectName: name, diagnostics: all,
-                                      build: buildNumber, buildFailed: lastBuildFailed, check: checkNumber)
-        bluetooth.send(snapshot)
+                                      build: buildNumber, buildFailed: lastBuildFailed, check: checkNumber,
+                                      liveTap: liveTapNumber)
+        if feedbackMode != .mac { bluetooth.send(snapshot) }       // keeps the watch in sync
+        if !usingWatch { playMacFeedback(old: previous, new: snapshot) }
+    }
+
+    // MARK: - Live checking
+
+    func liveTick() async {
+        accessibilityGranted = LiveEditorMonitor.isTrusted
+        guard liveEnabled else {
+            if livePath != nil { resetLive() }
+            liveStatus = buildOnly ? "Off (build-only mode)" : "Off"
+            return
+        }
+        guard accessibilityGranted else { liveStatus = "Needs Accessibility permission"; return }
+        guard let reading = LiveEditorMonitor.read() else { liveStatus = "Waiting for Xcode's code editor…"; return }
+
+        let now = Date()
+        liveCursorLine = reading.cursorLine
+        if reading.text != liveText {                      // still typing: do nothing yet
+            liveText = reading.text
+            liveTextChangedAt = now
+            liveShowAll = false
+            liveStatus = "Typing…"
+            return
+        }
+        // Which file is this? (Xcode often doesn't say, so match it with the saved files.)
+        let path: String?
+        if let document = reading.documentPath { path = document }
+        else if liveText == liveMatchedText, let livePath { path = livePath }
+        else { path = matchFile(for: liveText); liveMatchedText = liveText }
+        guard let path else { liveStatus = "Can't tell which file is open (save it once)"; return }
+        if path != livePath {
+            livePath = path
+            liveErrors = []
+            liveCheckedText = ""
+            liveReportedKeys = []
+            liveFirstCheck = true
+        }
+        // About 2 seconds after typing stops: syntax-check the unsaved text.
+        if liveText != liveCheckedText, now.timeIntervalSince(liveTextChangedAt) >= 2, !liveChecking {
+            liveChecking = true
+            let text = liveText
+            let devDir = developerDir
+            let errors = await Task.detached {
+                SwiftSyntaxChecker.check(text: text, reportAs: path, developerDir: devDir)
+            }.value
+            liveChecking = false
+            guard livePath == path, liveText == text else { return }     // changed meanwhile
+            liveErrors = errors
+            liveCheckedText = text
+        }
+        guard liveText == liveCheckedText else { return }                 // not checked yet
+        updateLiveReportable(countTap: true)
+        let file = (path as NSString).lastPathComponent
+        liveStatus = "\(file), line \(liveCursorLine): \(liveErrors.count) syntax error\(liveErrors.count == 1 ? "" : "s") (\(liveReportable.count) reported)"
+    }
+
+    /// The quiet filters. Errors already reported stay visible (no fake "fixed").
+    private func updateLiveReportable(countTap: Bool) {
+        let reportable = liveShowAll ? liveErrors : liveErrors.filter { error in
+            if shownKeys.contains(Self.key(error)) { return true }
+            if error.line == liveCursorLine { return false }                          // the line you're on
+            if error.message.hasPrefix("expected '}'"), error.line >= liveCursorLine { return false }  // block still open
+            return true
+        }
+        let keys = Set(reportable.map(Self.key))
+        if countTap, lineLeaveTap, !liveFirstCheck, !keys.subtracting(liveReportedKeys).isEmpty {
+            liveTapNumber += 1                      // you left a broken line: one gentle tap
+        }
+        liveFirstCheck = false
+        liveReportedKeys = keys
+        liveReportable = reportable
+    }
+
+    /// Finds the saved file most similar to the editor text.
+    private func matchFile(for text: String) -> String? {
+        let lines = text.components(separatedBy: "\n")
+        var best: (path: String, score: Int)?
+        for (path, saved) in contents {
+            let limit = min(lines.count, saved.count)
+            var prefix = 0
+            while prefix < limit, lines[prefix] == saved[prefix] { prefix += 1 }
+            var suffix = 0
+            while suffix < limit - prefix, lines[lines.count - 1 - suffix] == saved[saved.count - 1 - suffix] { suffix += 1 }
+            if best == nil || prefix + suffix > best!.score { best = (path, prefix + suffix) }
+        }
+        guard let best, best.score * 2 >= max(lines.count, 1) else { return nil }
+        return best.path
+    }
+
+    private func resetLive() {
+        livePath = nil
+        liveText = ""
+        liveCheckedText = ""
+        liveErrors = []
+        liveReportable = []
+        liveReportedKeys = []
+    }
+
+    // MARK: - Feedback without a watch (one-ear sounds)
+
+    private func updateRouteDescription() {
+        let text: String
+        switch feedbackMode {
+        case .watch: text = "Apple Watch"
+        case .mac: text = "Mac sounds (\(currentEar.rawValue) ear)"
+        case .automatic:
+            text = usingWatch ? "Apple Watch (connected)" : "Mac sounds, \(currentEar.rawValue) ear (no watch connected)"
+        }
+        if feedbackRoute != text { feedbackRoute = text }
+    }
+
+    private func playMacFeedback(old: DiagnosticSnapshot, new: DiagnosticSnapshot) {
+        let highlighted = macHighlighted ?? old.diagnostics.first
+        let feedback = FeedbackPlanner.plan(old: old, new: new, highlighted: highlighted, firstLoad: old.generation == 0)
+        if let highlighted, let same = new.diagnostics.first(where: { $0.isSameProblem(as: highlighted) }) {
+            macHighlighted = same
+        } else {
+            macHighlighted = new.diagnostics.first
+        }
+        guard old.generation != 0 else { return }          // no sounds when the app starts
+        audio.ear = currentEar
+        audio.play(feedback)
+        if autoSpeakMacSounds, let speech = feedback.speech {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(0.45))   // after the sound
+                self?.audio.speak(speech)
+            }
+        }
+    }
+
+    /// Plays every sound once, then the voice, in the chosen ear.
+    func testSounds() {
+        audio.ear = currentEar
+        let samples: [Feedback] = [.newError(""), .stillThere, .fixed, .lineLeft, .needsBuild, .checkedClear]
+        for (index, feedback) in samples.enumerated() {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(Double(index) * 0.9))
+                self?.audio.play(feedback)
+            }
+        }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(Double(samples.count) * 0.9 + 0.3))
+            self?.audio.speak("This is your error voice. Error, line 12: expected closing brace.")
+        }
+    }
+
+    // MARK: - Keyboard shortcuts (for use without a watch)
+    // ⌃⇧⌘E: read the error nearest the cursor · ⌃⇧⌘N: jump to the next error
+    // (⌃⌥ is VoiceOver's own key, so we avoid it.)
+
+    /// Registered hotkeys: allowed in the sandbox and need no Accessibility permission.
+    private func installHotkeys() {
+        guard !hotkeysTrusted else { return }
+        hotkeysTrusted = true
+        let modifiers = controlKey | shiftKey | cmdKey
+        hotKeys.register(keyCode: kVK_ANSI_E, modifiers: modifiers) { [weak self] in self?.speakCurrentError() }
+        hotKeys.register(keyCode: kVK_ANSI_N, modifiers: modifiers) { [weak self] in self?.openNextError() }
+    }
+
+    /// ⌃⇧⌘E: the error closest to your cursor in the open file (else the current one).
+    func speakCurrentError() {
+        let list = snapshot.diagnostics
+        let inFile = list.filter { $0.path == livePath }
+        let nearest = inFile.min { abs($0.line - liveCursorLine) < abs($1.line - liveCursorLine) }
+        guard let target = nearest ?? macHighlighted ?? list.first else {
+            speakNow("No errors")
+            return
+        }
+        macHighlighted = target
+        announceOnMac(target, after: 0, requested: true)
+    }
+
+    /// ⌃⇧⌘N: jump to the next error in Xcode.
+    func openNextError() {
+        let list = snapshot.diagnostics
+        guard !list.isEmpty else {
+            audio.ear = currentEar
+            audio.play(.checkedClear)
+            speakNow("No errors")
+            return
+        }
+        let index = macHighlighted.flatMap { current in list.firstIndex { $0.isSameProblem(as: current) } }
+        let next = list[index.map { ($0 + 1) % list.count } ?? 0]
+        macHighlighted = next
+        open(next, source: "Shortcut")
+    }
+
+    private func speakNow(_ text: String) {
+        if oneEarVoice {
+            audio.ear = currentEar
+            audio.speak(text)
+        } else if appStoreMode || Self.speakWithVoiceOver(text) != nil {
+            speakWithSynthesizer(text)
+        }
     }
 
     // MARK: - Requests from the iPhone
@@ -366,11 +720,20 @@ final class RelayModel: ObservableObject {
         // double tap on the watch reads the error). Landing in ANOTHER file → say what's wrong.
         let sameFile = currentFile == diagnostic.path
         do {
-            try XcodeNavigator.open(path: diagnostic.path, line: diagnostic.line, developerDir: developerDir)
+            if appStoreMode {
+                // The sandbox can't run `xed`: open the file, and the extension's
+                // "Jump to Error Line" command moves the cursor to the line.
+                XcodeNavigator.openSandboxed(path: diagnostic.path, line: diagnostic.line)
+            } else {
+                try XcodeNavigator.open(path: diagnostic.path, line: diagnostic.line, developerDir: developerDir)
+            }
             currentFile = diagnostic.path
             lastEvent = "\(source) opened \(diagnostic.fileName), line \(diagnostic.line)"
                 + (sameFile ? " (same file, silent)" : "")
-            if source.hasPrefix("Watch"), !sameFile { announceOnMac(diagnostic, after: 1.5, requested: false) }
+            // App Store-safe jumps don't move the cursor, so always say which line.
+            if source.hasPrefix("Watch") || source == "Shortcut", !sameFile || appStoreMode {
+                announceOnMac(diagnostic, after: 1.5, requested: false)
+            }
             return .json([RelayKeys.ok: true])
         } catch {
             lastEvent = "Could not open Xcode: \(error.localizedDescription)"
@@ -392,7 +755,13 @@ final class RelayModel: ObservableObject {
         Task { @MainActor [weak self] in
             if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
             guard let self else { return }
-            if NSWorkspace.shared.isVoiceOverEnabled {
+            if self.oneEarVoice {
+                // In one ear only, so it doesn't mix with VoiceOver reading your code.
+                self.audio.ear = self.currentEar
+                self.audio.speak(text)
+                return
+            }
+            if NSWorkspace.shared.isVoiceOverEnabled, !self.appStoreMode {
                 // macOS ignores announcements from background apps (Xcode is in front),
                 // so ask VoiceOver itself to speak, in the user's VoiceOver voice.
                 if let problem = Self.speakWithVoiceOver(text) {

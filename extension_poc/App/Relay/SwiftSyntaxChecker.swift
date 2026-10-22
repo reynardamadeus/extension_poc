@@ -46,6 +46,18 @@ nonisolated enum SwiftSyntaxChecker {
         return box.results
     }
 
+    /// Syntax-checks UNSAVED code (from the editor). Errors are reported as `path`.
+    static func check(text: String, reportAs path: String, developerDir: String?) -> [WatchDiagnostic] {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ErrorRelay-live-\(ProcessInfo.processInfo.processIdentifier).swift")
+        guard (try? text.write(to: temp, atomically: true, encoding: .utf8)) != nil else { return [] }
+        return check(file: temp.path, developerDir: developerDir).map { error in
+            var error = error
+            error.path = path
+            return error
+        }
+    }
+
     /// Syntax-checks one file.
     static func check(file path: String, developerDir: String?) -> [WatchDiagnostic] {
         let process = Process()

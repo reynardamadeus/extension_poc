@@ -17,7 +17,15 @@ nonisolated enum SharedSettings {
         static let style = "bracketStyle"
         static let includeContext = "includeContext"
         static let annotateNewBlocks = "annotateNewBlocks"
+        /// The error line the Mac app wants the extension to jump to (App Store-safe jumps).
+        static let pendingJump = "pendingJump"
+        /// Latest "Read Line Context" result, shown by the app's floating panel.
+        static let lineContext = "lineContext"
+        static let showLineContextPanel = "showLineContextPanel"
     }
+
+    /// Posted by the extension after it saves a new line context (no userInfo: the sandbox strips it).
+    static let lineContextNotification = Notification.Name("CWW22WYZK6.project.extension-poc.lineContext")
 
     static var defaults: UserDefaults {
         UserDefaults(suiteName: appGroupID) ?? .standard

@@ -14,12 +14,15 @@ struct ContentView: View {
     var body: some View {
         TabView {
             Home()
-                .tabItem { Label("Braces", systemImage: "curlybraces") }
+                .tabItem { Label("Commands", systemImage: "waveform") }
             RelayView(model: relay)
                 .tabItem { Label("Watch Relay", systemImage: "applewatch") }
         }
         .frame(minWidth: 560, minHeight: 640)
-        .onAppear { relay.start() }
+        .onAppear {
+            relay.start()
+            LineContextPanelController.shared.start()
+        }
         .alert(
             "Allow \u{201C}\(relay.pairingRequest?.watchName ?? "Apple Watch")\u{201D} to receive your errors?",
             isPresented: Binding(

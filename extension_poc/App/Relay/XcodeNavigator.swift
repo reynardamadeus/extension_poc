@@ -17,7 +17,18 @@ nonisolated enum XcodeNavigator {
         return app.appendingPathComponent("Contents/Developer").path
     }
 
-    /// Brings Xcode to the front with `path` open and the cursor on `line`.
+    /// App Store-safe: opens the file in Xcode (no exact line: the sandbox can't run `xed`).
+    /// The target line is left for the extension's "Jump to Error Line" command.
+    static func openSandboxed(path: String, line: Int) {
+        SharedSettings.defaults.set(["file": (path as NSString).lastPathComponent,
+                                     "line": line,
+                                     "at": Date().timeIntervalSince1970], forKey: SharedSettings.Key.pendingJump)
+        guard let xcode = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.dt.Xcode") else { return }
+        NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: xcode,
+                                configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+    }
+
+    /// Brings Xcode to the front with `path` open and the cursor on `line` (needs the sandbox off).
     static func open(path: String, line: Int, developerDir: String?) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/xed")

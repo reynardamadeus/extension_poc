@@ -63,16 +63,8 @@ final class WatchBridge: ObservableObject {
 
     // MARK: - Error list
 
-    /// ONE answer per action:
-    /// ⌘B / ⌘R (build finished)
-    ///   • failed    → failure buzz + "Build failed. N errors. <highlighted error>"
-    ///   • succeeded → success tap + "Build succeeded"
-    /// ⌘S (save, quick syntax check)
-    ///   • all clear now                       → success tap + "No syntax errors" (a click if already clear)
-    ///   • the highlighted error is gone       → success tap
-    ///   • a new error appeared                → failure buzz + that error read aloud
-    ///   • highlighted error needs a build     → "up" tap + "Saved. Press Command B to check."
-    ///   • highlighted error still there       → "retry" tap
+    /// What to tell the user is decided by the shared FeedbackPlanner (same rules as the Mac);
+    /// here it becomes a haptic + optional speech.
     private func handle(_ new: DiagnosticSnapshot) {
         let old = snapshot
         let firstLoad = !hasLoaded
@@ -80,9 +72,7 @@ final class WatchBridge: ObservableObject {
         snapshot = new
         hasLoaded = true
 
-        let finishedBuild = !firstLoad && new.build != old.build
-        let saved = !firstLoad && new.check != old.check
-        guard firstLoad || finishedBuild || saved || new.diagnostics != old.diagnostics else { return }
+        let feedback = FeedbackPlanner.plan(old: old, new: new, highlighted: highlighted, firstLoad: firstLoad)
 
         // Keep the highlight on the same problem even if its line number moved.
         if let highlighted, let index = new.diagnostics.firstIndex(where: { $0.isSameProblem(as: highlighted) }) {
@@ -90,54 +80,18 @@ final class WatchBridge: ObservableObject {
         } else {
             selectedIndex = min(selectedIndex, max(new.diagnostics.count - 1, 0))
         }
-        let current = highlighted.flatMap { h in new.diagnostics.first { $0.isSameProblem(as: h) } }
-        let highlightedSolved = highlighted != nil && current == nil
-        let added = new.diagnostics.filter { candidate in
-            !old.diagnostics.contains { $0.isSameProblem(as: candidate) }
-        }
+
         let device = WKInterfaceDevice.current()
-
-        if firstLoad {
-            if let first = new.diagnostics.first {
-                device.play(.failure)
-                announce("\(Self.count(new.diagnostics.count)). \(first.spokenSummary)")
-            }
-        } else if finishedBuild {
-            if new.buildFailed {
-                device.play(.failure)
-                announce("Build failed. \(Self.count(new.diagnostics.count)). \(selected?.spokenSummary ?? "")")
-            } else {
-                device.play(.success)
-                announce("Build succeeded")
-            }
-        } else if saved {
-            if new.diagnostics.isEmpty {
-                if old.diagnostics.isEmpty {
-                    device.play(.click)                     // checked, still all clear
-                } else {
-                    device.play(.success)
-                    announce("No syntax errors")
-                }
-            } else if highlightedSolved {
-                device.play(.success)                       // the error you were working on is gone
-            } else if let first = added.first {
-                device.play(.failure)
-                announce("New error. \(first.spokenSummary)")
-            } else if current?.kind == .needsBuild {
-                device.play(.directionUp)                   // can only be confirmed by building
-                announce("Saved. Press Command B to check.")
-            } else {
-                device.play(.retry)                         // still there
-            }
-        } else if let first = added.first {
-            // Errors changed without a save or build (e.g. a held error released): only speak up for new ones.
-            device.play(.failure)
-            announce("New error. \(first.spokenSummary)")
+        switch feedback {
+        case .none: return
+        case .firstErrors, .buildFailed, .newError: device.play(.failure)
+        case .buildSucceeded, .allClear, .fixed: device.play(.success)
+        case .checkedClear: device.play(.click)
+        case .needsBuild: device.play(.directionUp)
+        case .stillThere: device.play(.retry)
+        case .lineLeft: device.play(.directionDown)      // gentle, no speech
         }
-    }
-
-    private static func count(_ n: Int) -> String {
-        n == 1 ? "1 error" : "\(n) errors"
+        if let speech = feedback.speech { announce(speech) }
     }
 
     // MARK: - Navigation
@@ -217,12 +171,5 @@ final class WatchBridge: ObservableObject {
     func readSelected() {
         guard let error = selected else { announce("No syntax errors"); return }
         announce("Error \(selectedIndex + 1) of \(errors.count). \(error.spokenSummary)")
-    }
-}
-
-extension WatchDiagnostic {
-    /// Same error even if editing above it moved it to another line.
-    func isSameProblem(as other: WatchDiagnostic) -> Bool {
-        fileName == other.fileName && message == other.message
     }
 }

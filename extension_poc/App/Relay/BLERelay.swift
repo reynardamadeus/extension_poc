@@ -89,6 +89,9 @@ nonisolated final class BLERelay: NSObject, CBPeripheralManagerDelegate, @unchec
 
     // MARK: - Public
 
+    /// Paired watches connected right now (0 → the Mac plays sounds instead).
+    var verifiedWatchCount: Int { sessions.values.filter(\.authenticated).count }
+
     func start() {
         guard manager == nil else { return }
         manager = CBPeripheralManager(delegate: self, queue: nil)   // nil = main queue

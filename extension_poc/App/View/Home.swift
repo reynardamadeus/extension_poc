@@ -4,70 +4,70 @@
 //
 //  Created by Reynard Amadeus  on 12/10/26.
 //
+//  Lists the Xcode extension's commands (CodeVoice + Open Block + Jump to Error)
+//  and how to turn the extension on.
+//
 
 import SwiftUI
 import AppKit
 
 struct Home: View {
-    // Stored in the shared App Group, so the Xcode extension sees the same values.
-    @AppStorage(SharedSettings.Key.style, store: SharedSettings.defaults)
-    private var style: BracketSetting = .beginEnd
-
-    @AppStorage(SharedSettings.Key.includeContext, store: SharedSettings.defaults)
-    private var includeContext: Bool = true
-
-    @AppStorage(SharedSettings.Key.annotateNewBlocks, store: SharedSettings.defaults)
-    private var annotateNewBlocks: Bool = true
-
-    private let sample = """
-    struct Greeting {
-        func greet(isMorning: Bool) {
-            if isMorning {
-                print("Good morning")
-            } else {
-                print("Hello")
-            }
-        }
+    @AppStorage(SharedSettings.Key.showLineContextPanel, store: SharedSettings.defaults)
+    private var showPanel = true
+    private struct Command: Identifiable {
+        let name: String
+        let says: String
+        var id: String { name }
     }
-    """
 
-    private var previewLines: [String] {
-        let lines = sample.components(separatedBy: "\n")
-        return BraceAnnotator(style: style, includeContext: includeContext).annotating(lines)
-    }
+    private let codeVoice: [Command] = [
+        .init(name: "Show Lines in Panel", says: "Shows the real code around your cursor (or your selection) in the floating panel"),
+        .init(name: "Read Line Context", says: "\u{201C}Inside struct Greeting. Line 5. Code: \u{2026}\u{201D}"),
+        .init(name: "Read Line Context v2", says: "\u{201C}Line 5: variable name within struct Greeting.\u{201D}"),
+        .init(name: "Read Line Context v3", says: "\u{201C}Line 5: func greet inside struct Greeting.\u{201D}"),
+        .init(name: "Read Code Structure", says: "Line, nesting level, and the block's start and end lines"),
+        .init(name: "Check Code Errors", says: "Bracket and quote problems, then an AI check of the file"),
+        .init(name: "Summarize File", says: "How many structs, classes and functions, plus a one-sentence summary"),
+        .init(name: "Explain Selected Code", says: "A plain-English sentence about the selected code"),
+        .init(name: "Analyze Line Impact", says: "What the line belongs to and what changing it affects"),
+    ]
 
     var body: some View {
         Form {
-            Section("How VoiceOver should hear braces") {
-                Picker("Words", selection: $style) {
-                    ForEach(BracketSetting.allCases) { option in
-                        Text(option.label).tag(option)
+            Section("CodeVoice: hear where you are") {
+                ForEach(codeVoice) { command in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(command.name).font(.headline)
+                        Text(command.says).foregroundStyle(.secondary)
                     }
+                    .accessibilityElement(children: .combine)
                 }
-                .pickerStyle(.radioGroup)
-
-                Toggle("Say which block is ending (e.g. \u{201C}end if isMorning\u{201D})",
-                       isOn: $includeContext)
-            }
-
-            Section("Open Block (Smart Return)") {
-                Toggle("Add \(style.openWord) / \(style.closeWord) comments to new blocks",
-                       isOn: $annotateNewBlocks)
-                Text("Type a line such as add() and press your shortcut (we suggest ⌥Return). The extension adds { and }, and puts the cursor inside. Set the shortcut in Xcode → Settings → Key Bindings, search \u{201C}Open Block\u{201D}.")
+                Text("AI commands use Apple Intelligence on this Mac (on-device). If it's off or unavailable, they fall back to a shorter answer.")
                     .foregroundStyle(.secondary)
             }
 
-            Section("Preview") {
-                VStack(alignment: .leading, spacing: 2) {
-                    // One Text per line so VoiceOver can read it line by line.
-                    ForEach(Array(previewLines.enumerated()), id: \.offset) { _, line in
-                        Text(line.isEmpty ? " " : line)
-                            .font(.system(.body, design: .monospaced))
-                    }
+            Section("Line Context panel") {
+                Toggle("Show Read Line Context results in a floating panel", isOn: $showPanel)
+                Text("The panel appears in the top-right corner without taking focus from Xcode, and hides after 8 seconds unless you tick Keep open. Press ⌃⇧⌘L to move focus into the panel so VoiceOver reads it; press Esc to close it and go back to Xcode. This app must be running.")
+                    .foregroundStyle(.secondary)
+                Button("Show Test Panel") {
+                    LineContextPanelController.shared.showTest()
                 }
-                .textSelection(.enabled)
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Preview of annotated code")
+            }
+
+            Section("Editing and errors") {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Open Block (Smart Return)").font(.headline)
+                    Text("Type a line such as add() and press your shortcut (we suggest ⌥Return). The extension adds { and } and puts the cursor inside.")
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Jump to Error Line").font(.headline)
+                    Text("After the watch or ⌃⇧⌘N opens an error's file, this moves the cursor to the error's line.")
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
             }
 
             Section("Set up the Xcode extension") {
@@ -79,10 +79,8 @@ struct Home: View {
                     .foregroundStyle(SharedSettings.isAppGroupAvailable ? .green : .orange)
 
                 Text("1. Open System Settings → General → Login Items & Extensions → Xcode Source Editor, and turn this extension on.")
-                Text("2. Quit and reopen Xcode.")
-                Text("3. In Xcode, choose Editor → Brace Reader → Annotate Braces.")
-                Text("Changing the words here applies the next time you run the command. No Xcode restart needed.")
-                    .foregroundStyle(.secondary)
+                Text("2. Quit and reopen Xcode. The commands are in the Editor menu under this extension's name.")
+                Text("3. Give the ones you use most a shortcut: Xcode → Settings → Key Bindings, search the command name.")
 
                 Button("Open Extension Settings") {
                     let url = URL(string: "x-apple.systempreferences:com.apple.ExtensionsPreferences?extensionPointIdentifier=com.apple.dt.Xcode.extension.source-editor")!
