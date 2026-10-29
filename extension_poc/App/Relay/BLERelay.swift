@@ -28,8 +28,26 @@ nonisolated enum TrustedWatches {
         return (try? JSONDecoder().decode([TrustedWatch].self, from: data)) ?? []
     }
 
+    /// Adding a watch replaces an older entry with the same name: that's the same watch
+    /// that got a new ID (reinstalled app), not a second watch. Its old key is deleted too.
     static func add(_ watch: TrustedWatch) {
-        save(all.filter { $0.id != watch.id } + [watch])
+        let list = all
+        for old in list where old.id != watch.id && old.name == watch.name {
+            KeyStore.delete(account: keychainAccount(old.id))
+        }
+        save(list.filter { $0.id != watch.id && $0.name != watch.name } + [watch])
+    }
+
+    /// One-time cleanup of the duplicates made before: keeps the newest entry per name.
+    static func removeDuplicates() {
+        let list = all
+        var keep: [TrustedWatch] = []
+        for watch in list.reversed() where !keep.contains(where: { $0.name == watch.name }) {
+            keep.insert(watch, at: 0)
+        }
+        guard keep.count != list.count else { return }
+        for old in list where !keep.contains(old) { KeyStore.delete(account: keychainAccount(old.id)) }
+        save(keep)
     }
 
     static func remove(id: String) {
@@ -61,7 +79,10 @@ nonisolated final class BLERelay: NSObject, CBPeripheralManagerDelegate, @unchec
     var onPairingRequest: (@MainActor (PairingRequest) -> Void)?
     var onPairingCancelled: (@MainActor (_ watchID: String) -> Void)?
     var onTrustedChanged: (@MainActor () -> Void)?
-    var onSpeak: (@MainActor (_ generation: Int, _ index: Int) -> Void)?
+    /// Watch double tap: read an error. The answer goes back so the watch can tap success / failure.
+    var onSpeak: (@MainActor (_ generation: Int, _ index: Int) -> (ok: Bool, message: String))?
+    /// Watch double tap with no error shown: say the current state.
+    var onStatusRequest: (@MainActor () -> (ok: Bool, message: String))?
 
     /// One connected watch.
     private final class Session {
@@ -208,10 +229,18 @@ nonisolated final class BLERelay: NSObject, CBPeripheralManagerDelegate, @unchec
             if let key = KeyStore.load(account: TrustedWatches.keychainAccount(parts[1])) {
                 session.key = key
                 session.watchName = TrustedWatches.all.first(where: { $0.id == parts[1] })?.name ?? session.watchName
+                // Key survived but the list didn't (the sandbox started with empty settings):
+                // put the watch back in "paired watches" so the Mac shows it again.
+                if !TrustedWatches.all.contains(where: { $0.id == parts[1] }) {
+                    TrustedWatches.add(TrustedWatch(id: parts[1], name: session.watchName))
+                    MainActor.assumeIsolated { onTrustedChanged?() }
+                }
+                report("Watch found: checking its pairing…")
                 let nonce = SecureLink.randomNonce()
                 session.nonce = nonce
                 enqueue(BLEMessage(t: "challenge", n: nonce), to: session, kind: .control)
             } else {
+                report("New watch found: waiting for it to send a pairing request…")
                 enqueue(BLEMessage(t: "unpaired"), to: session, kind: .control)
             }
 
@@ -238,6 +267,7 @@ nonisolated final class BLERelay: NSObject, CBPeripheralManagerDelegate, @unchec
             session.authenticated = false
             enqueue(BLEMessage(t: "pairing", k: SecureLink.publicKeyString(myKey)), to: session, kind: .control)
             let request = PairingRequest(watchID: parts[1], watchName: session.watchName, code: derived.code)
+            report("\(session.watchName) wants to pair: code \(derived.code)")
             MainActor.assumeIsolated { onPairingRequest?(request) }
 
         case "sec" where parts.count >= 2:
@@ -256,8 +286,13 @@ nonisolated final class BLERelay: NSObject, CBPeripheralManagerDelegate, @unchec
         let parts = text.split(separator: ":")
         if parts.first == "fetch" {
             sendCurrentSnapshot(to: session)
+        } else if parts.first == "status" {
+            let result = MainActor.assumeIsolated { onStatusRequest?() } ?? (ok: false, message: "Mac app not ready")
+            sendResult(ok: result.ok, message: result.message, to: session)
         } else if parts.count == 3, parts[0] == "speak", let generation = Int(parts[1]), let index = Int(parts[2]) {
-            MainActor.assumeIsolated { onSpeak?(generation, index) }
+            let result = MainActor.assumeIsolated { onSpeak?(generation, index) } ?? (ok: false, message: "Mac app not ready")
+            sendResult(ok: result.ok, message: result.message, to: session)
+            sendCurrentSnapshot(to: session)                     // keep the watch's list fresh
         } else if parts.count == 3, parts[0] == "open", let generation = Int(parts[1]), let index = Int(parts[2]) {
             let result = MainActor.assumeIsolated { onOpen?(generation, index) } ?? (ok: false, message: "Mac app not ready")
             sendResult(ok: result.ok, message: result.message, to: session)
@@ -298,6 +333,7 @@ nonisolated final class BLERelay: NSObject, CBPeripheralManagerDelegate, @unchec
                            didSubscribeTo characteristic: CBCharacteristic) {
         guard characteristic.uuid == messageCharacteristic.uuid, sessions[central.identifier] == nil else { return }
         sessions[central.identifier] = Session(central: central)   // nothing is sent until it says hello
+        report("A watch connected: waiting for it to say hello…")
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral,

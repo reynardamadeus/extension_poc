@@ -19,6 +19,11 @@ nonisolated enum BuildLogReader {
     /// - derivedData: Xcode's DerivedData folder (granted by the user in the sandbox).
     static func derivedDataFolders(for projectFolder: URL, in derivedData: URL) -> [URL] {
         let root = derivedData
+        // The user picked ONE project's folder (e.g. DerivedData/Files-abc123) instead of
+        // DerivedData itself: it has its own info.plist. Use it as is.
+        if FileManager.default.fileExists(atPath: root.appendingPathComponent("info.plist").path) {
+            return [root]
+        }
         guard let folders = try? FileManager.default.contentsOfDirectory(
             at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return [] }
         let projectPath = projectFolder.standardizedFileURL.path

@@ -3,11 +3,11 @@
 //  watch Watch App
 //
 //  Talks to the Mac directly over Bluetooth (MacLink). The Mac pushes the
-//  error list whenever it changes; this plays haptics, speaks the change,
-//  and sends "open this error in Xcode" requests.
+//  error list whenever it changes; this plays haptics only (never speaks:
+//  speech on the watch would overlap with VoiceOver on the Mac), and sends
+//  "open this error in Xcode" requests. The Mac reads the error after the jump.
 //
 
-import AVFoundation
 import Combine
 import Foundation
 import SwiftUI
@@ -52,6 +52,13 @@ final class WatchBridge: ObservableObject {
     // MARK: - Connection
 
     func connect() { link.connect() }
+
+    /// Watch button "Find my Mac again".
+    func rediscover() {
+        WKInterfaceDevice.current().play(.click)
+        status = "Searching for your Mac…"
+        link.rediscover()
+    }
     func disconnect() { link.disconnect() }
 
     /// Removes the pairing with the Mac; the next connection pairs again.
@@ -64,7 +71,7 @@ final class WatchBridge: ObservableObject {
     // MARK: - Error list
 
     /// What to tell the user is decided by the shared FeedbackPlanner (same rules as the Mac);
-    /// here it becomes a haptic + optional speech.
+    /// here it becomes a haptic only. The Mac speaks.
     private func handle(_ new: DiagnosticSnapshot) {
         let old = snapshot
         let firstLoad = !hasLoaded
@@ -89,9 +96,14 @@ final class WatchBridge: ObservableObject {
         case .checkedClear: device.play(.click)
         case .needsBuild: device.play(.directionUp)
         case .stillThere: device.play(.retry)
-        case .lineLeft: device.play(.directionDown)      // gentle, no speech
+        case .lingeringError(let error):
+            // Live detection: this error stayed (default 10 s). Highlight it so the next
+            // double tap jumps straight to it, then buzz.
+            if let index = new.diagnostics.firstIndex(where: { $0.isSameProblem(as: error) }) {
+                selectedIndex = index
+            }
+            device.play(.failure)
         }
-        if let speech = feedback.speech { announce(speech) }
     }
 
     // MARK: - Navigation
@@ -100,7 +112,23 @@ final class WatchBridge: ObservableObject {
         guard !errors.isEmpty else { return }
         selectedIndex = (selectedIndex + step + errors.count) % errors.count
         WKInterfaceDevice.current().play(.click)
-        readSelected()
+    }
+
+    /// Double tap: the Mac reads the highlighted error through VoiceOver,
+    /// or says "No errors yet" when there are none. The watch itself stays silent.
+    func readOnMac() {
+        let sent = selected != nil
+            ? link.speak(generation: snapshot.generation, index: selectedIndex)
+            : link.requestStatus()
+        WKInterfaceDevice.current().play(sent ? .click : .failure)
+        if !sent { status = "Not connected to your Mac" }
+    }
+
+    /// Double tap (non-sandboxed Mac): Xcode jumps to the highlighted error's line, then the
+    /// Mac reads it with context. No errors → the Mac says "No errors yet".
+    func goToSelected() {
+        guard selected != nil else { readOnMac(); return }
+        openSelected()
     }
 
     /// Opens the highlighted error in Xcode on the Mac. The highlight stays on it
@@ -128,48 +156,5 @@ final class WatchBridge: ObservableObject {
         } else {
             WKInterfaceDevice.current().play(.failure)
         }
-    }
-
-    // MARK: - Speaking errors
-
-    private let speaker = AVSpeechSynthesizer()
-
-    /// "Speak errors aloud" setting (watch ⚙︎ sheet). On by default.
-    private var speakAloud: Bool {
-        UserDefaults.standard.object(forKey: "speakErrors") as? Bool ?? true
-    }
-
-    /// VoiceOver on  → hand the text to VoiceOver (user's own voice and speed).
-    /// VoiceOver off → read it with the speech engine (if "Speak errors aloud" is on).
-    /// Apps can't switch VoiceOver on themselves; that stays the user's choice.
-    func announce(_ text: String) {
-        if WKAccessibilityIsVoiceOverRunning() {
-            AccessibilityNotification.Announcement(text).post()
-        } else if speakAloud {
-            speaker.stopSpeaking(at: .immediate)
-            let utterance = AVSpeechUtterance(string: text)
-            utterance.voice = AVSpeechSynthesisVoice(language: "en-US")   // compiler messages are English
-            speaker.speak(utterance)
-        }
-    }
-
-    /// Double tap: the Mac reads the highlighted error through VoiceOver (same voice as
-    /// the code, when you ask for it). Not connected → the watch reads it instead.
-    func speakSelectedOnMac() {
-        guard selected != nil else {
-            WKInterfaceDevice.current().play(.failure)
-            return
-        }
-        if link.speak(generation: snapshot.generation, index: selectedIndex) {
-            WKInterfaceDevice.current().play(.click)
-        } else {
-            readSelected()
-        }
-    }
-
-    /// Reads the currently selected error on the watch.
-    func readSelected() {
-        guard let error = selected else { announce("No syntax errors"); return }
-        announce("Error \(selectedIndex + 1) of \(errors.count). \(error.spokenSummary)")
     }
 }

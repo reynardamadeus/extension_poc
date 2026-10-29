@@ -48,6 +48,9 @@ class SourceEditorCommand: NSObject, XCSourceEditorCommand {
         let position = XCSourceTextPosition(line: line - 1, column: 0)
         buffer.selections.removeAllObjects()
         buffer.selections.add(XCSourceTextRange(start: position, end: position))
+        // Tell the Mac app the cursor is there now; it reads the error next.
+        DistributedNotificationCenter.default().postNotificationName(
+            SharedSettings.jumpedNotification, object: nil, userInfo: nil, deliverImmediately: true)
         return nil
     }
 

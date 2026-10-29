@@ -58,8 +58,8 @@
       queueDebuggingEnabled = "No">
       <RemoteRunnable
          runnableDebuggingMode = "0"
-         BundleIdentifier = "com.apple.dt.Xcode"
-         RemotePath = "/Applications/Xcode.app">
+         BundleIdentifier = "com.apple.Notes"
+         RemotePath = "/System/Applications/Notes.app">
       </RemoteRunnable>
       <MacroExpansion>
          <BuildableReference

@@ -104,6 +104,16 @@ nonisolated enum KeyStore {
         return SymmetricKey(data: data)
     }
 
+    /// Small text values (the watch's ID): kept in the Keychain because it survives
+    /// reinstalling the app, unlike UserDefaults.
+    static func saveString(_ text: String, account: String) {
+        save(SymmetricKey(data: Data(text.utf8)), account: account)
+    }
+
+    static func loadString(account: String) -> String? {
+        load(account: account).map { key in key.withUnsafeBytes { String(decoding: $0, as: UTF8.self) } }
+    }
+
     static func delete(account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

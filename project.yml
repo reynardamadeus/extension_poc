@@ -5,6 +5,7 @@
 #
 # Targets
 #   extension_poc     macOS companion app (Watch Relay, Commands tab, Line Context panel).
+#                     NOT sandboxed (live error detection, xed jumps, VoiceOver via AppleScript).
 #                     Embeds the Xcode extension.
 #   test_extension    Xcode Source Editor extension (CodeVoice, Show Lines in Panel,
 #                     Open Block, Jump to Error Line). Always sandboxed (Apple requires it).
@@ -66,9 +67,12 @@ targets:
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: Connects to your Mac to read syntax errors
         CODE_SIGN_ENTITLEMENTS: extension_poc/extension_poc.entitlements
-        # Research build: sandbox off (live checking, xed jumps).
-        # For the App Store build set this to YES (see "App Store-safe mode").
-        ENABLE_APP_SANDBOX: YES
+        # NON-SANDBOXED BUILD (team decision, Oct 2026): the App Sandbox is OFF so the app can
+        # read Xcode's editor live (Accessibility), run `swiftc -parse` and `xed --line`, and
+        # read DerivedData without pickers. Distribution: direct (Developer ID + notarization),
+        # not the Mac App Store. The app detects this at runtime (SandboxSupport.isSandboxed),
+        # so flipping this back to YES still builds the App Store-safe version.
+        ENABLE_APP_SANDBOX: NO
         ENABLE_HARDENED_RUNTIME: YES
         REGISTER_APP_GROUPS: YES
         ENABLE_PREVIEWS: YES

@@ -33,9 +33,15 @@ nonisolated enum SandboxSupport {
     // MARK: - Remember folders the user picked
 
     static func saveBookmark(for url: URL, key: String) {
-        if let data = try? url.bookmarkData(options: [.withSecurityScope],
-                                            includingResourceValuesForKeys: nil, relativeTo: nil) {
+        // The app only READS the folders the user picks (files.user-selected.read-only),
+        // so the bookmark must be read-only too, or creating it fails and the folder is
+        // forgotten on the next launch.
+        do {
+            let data = try url.bookmarkData(options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
+                                            includingResourceValuesForKeys: nil, relativeTo: nil)
             UserDefaults.standard.set(data, forKey: key)
+        } catch {
+            NSLog("Could not remember \(url.path): \(error.localizedDescription)")
         }
     }
 

@@ -19,15 +19,18 @@ nonisolated enum Feedback: Equatable, Sendable {
     case newError(String)        // ⌘S: a new error appeared
     case needsBuild              // ⌘S: the highlighted (type) error can only be confirmed by building
     case stillThere              // ⌘S: the highlighted error is still there
-    case lineLeft                // live: you left a line that's still broken (gentle, silent)
+    /// Live (non-sandboxed): an error stayed in the unsaved code for the linger time
+    /// (default 10 s, set in the Mac app). Error haptic; double tap jumps to it.
+    case lingeringError(WatchDiagnostic)
 
     /// What to say (nil = sound/haptic only).
     var speech: String? {
         switch self {
         case .firstErrors(let text), .buildFailed(let text), .newError(let text): return text
         case .buildSucceeded: return "Build succeeded"
-        case .allClear: return "No syntax errors"
+        case .allClear: return "No errors"
         case .needsBuild: return "Saved. Press Command B to check."
+        case .lingeringError(let error): return "Error. \(error.spokenSummary)"
         default: return nil
         }
     }
@@ -38,7 +41,9 @@ nonisolated enum FeedbackPlanner {
     /// - highlighted: the error the user is working on (watch selection / last jumped-to on the Mac).
     static func plan(old: DiagnosticSnapshot, new: DiagnosticSnapshot,
                      highlighted: WatchDiagnostic?, firstLoad: Bool) -> Feedback {
-        if firstLoad {
+        // Pausing is silent. Reopening the project is like starting fresh: errors → error haptic.
+        if new.paused { return .none }
+        if firstLoad || (old.paused && !new.paused) {
             guard let first = new.diagnostics.first else { return .none }
             return .firstErrors("\(count(new.diagnostics.count)). \(first.spokenSummary)")
         }
@@ -66,7 +71,10 @@ nonisolated enum FeedbackPlanner {
             if current?.kind == .needsBuild { return .needsBuild }
             return .stillThere
         }
-        if liveTap { return .lineLeft }
+        // Live, the error near the cursor: re-checked as you type.
+        if new.liveFixed != old.liveFixed { return .fixed }
+        if new.liveStill != old.liveStill, !new.diagnostics.isEmpty { return .stillThere }
+        if liveTap, let lingering = added.first ?? new.diagnostics.first { return .lingeringError(lingering) }
         if solved { return .fixed }          // fixed while typing (live)
         return .none
     }

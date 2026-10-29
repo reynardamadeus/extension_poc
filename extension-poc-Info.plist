@@ -8,7 +8,7 @@
 		<true/>
 	</dict>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>Asks VoiceOver to read the syntax error after Xcode jumps to it.</string>
+	<string>Lets VoiceOver read your errors in your own voice, and opens the right Xcode project before jumping to an error.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Sends syntax errors to your Apple Watch over Bluetooth.</string>
 	<key>NSBonjourServices</key>

@@ -52,6 +52,20 @@ nonisolated enum LiveEditorMonitor {
         return EditorReading(text: text, cursorLine: cursorLine, documentPath: path)
     }
 
+    /// Titles of Xcode's windows, e.g. "extension_poc — RelayModel.swift" (project first).
+    /// Empty when Xcode isn't running. Used to notice a project being opened.
+    static func xcodeWindowTitles() -> [String] {
+        guard AXIsProcessTrusted(),
+              let xcode = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dt.Xcode").first
+        else { return [] }
+        let app = AXUIElementCreateApplication(xcode.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return [] }
+        return windows.compactMap { string($0, kAXTitleAttribute) }
+    }
+
     // MARK: - Accessibility helpers
 
     private static func string(_ element: AXUIElement, _ attribute: String) -> String? {

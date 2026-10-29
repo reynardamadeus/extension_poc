@@ -26,6 +26,9 @@ nonisolated enum SharedSettings {
 
     /// Posted by the extension after it saves a new line context (no userInfo: the sandbox strips it).
     static let lineContextNotification = Notification.Name("CWW22WYZK6.project.extension-poc.lineContext")
+    /// Posted by the extension after "Jump to Error Line" moved the cursor, so the app
+    /// reads the error only once the cursor is really on it (App Store-safe jumps).
+    static let jumpedNotification = Notification.Name("CWW22WYZK6.project.extension-poc.jumped")
 
     static var defaults: UserDefaults {
         UserDefaults(suiteName: appGroupID) ?? .standard

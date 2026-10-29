@@ -38,13 +38,20 @@ nonisolated final class MacLink: NSObject, CBCentralManagerDelegate, CBPeriphera
     private var authenticated = false
     private var pairingKey: P256.KeyAgreement.PrivateKey?
     private var pendingKey: SymmetricKey?
+    /// Gives up on a connection that never finishes the hello (stale Bluetooth link,
+    /// e.g. after the Mac app restarted), so it can't hang on "Connecting…" forever.
+    private var handshakeWatchdog: DispatchWorkItem?
 
     /// A stable random ID for this watch (no personal data).
+    /// Kept in the Keychain, next to the pairing key: UserDefaults is wiped when the app is
+    /// reinstalled (new Xcode build, TestFlight), the Keychain isn't. A new ID with the old
+    /// key made the Mac see a "new" watch every time and pile up paired watches.
     private let watchID: String = {
-        if let saved = UserDefaults.standard.string(forKey: "watchID") { return saved }
-        let new = UUID().uuidString
-        UserDefaults.standard.set(new, forKey: "watchID")
-        return new
+        if let saved = KeyStore.loadString(account: "watchID") { return saved }
+        let id = UserDefaults.standard.string(forKey: "watchID") ?? UUID().uuidString   // older builds
+        KeyStore.saveString(id, account: "watchID")
+        UserDefaults.standard.set(id, forKey: "watchID")
+        return id
     }()
 
     // MARK: - Public
@@ -64,6 +71,19 @@ nonisolated final class MacLink: NSObject, CBCentralManagerDelegate, CBPeriphera
         if let mac { central?.cancelPeripheralConnection(mac) }
     }
 
+    /// "Find my Mac again": drops the current (maybe stuck) link and starts over,
+    /// so the Mac gets a fresh hello and shows the pairing code if it needs one.
+    func rediscover() {
+        wantsConnection = true
+        guard let central else { connect(); return }
+        if let mac {
+            central.cancelPeripheralConnection(mac)   // → didDisconnect → reset → new search
+        } else {
+            central.stopScan()
+            scanIfNeeded()
+        }
+    }
+
     /// Forget the pairing; the next connection pairs again.
     func forgetMac() {
         KeyStore.delete(account: Self.keyAccount)
@@ -79,6 +99,11 @@ nonisolated final class MacLink: NSObject, CBCentralManagerDelegate, CBPeriphera
 
     func requestSnapshot() {
         _ = writeSecure("fetch")
+    }
+
+    /// Asks the Mac to say the current state ("No errors yet"…) through VoiceOver.
+    func requestStatus() -> Bool {
+        writeSecure("status")
     }
 
     /// Asks the Mac to read this error aloud through VoiceOver. False when not connected.
@@ -132,6 +157,7 @@ nonisolated final class MacLink: NSObject, CBCentralManagerDelegate, CBPeriphera
                   let derived = SecureLink.derive(myKey: pairingKey, theirPublicKey: theirKey) else { return }
             pendingKey = derived.key
             let code = derived.code
+            handshakeDone()
             MainActor.assumeIsolated { onPairingCode?(code) }
             report("Compare the code with your Mac", connected: false)
 
@@ -153,6 +179,7 @@ nonisolated final class MacLink: NSObject, CBCentralManagerDelegate, CBPeriphera
             disconnect()
 
         case "authed":
+            handshakeDone()
             authenticated = true
             report("Connected to your Mac", connected: true)
 
@@ -190,9 +217,34 @@ nonisolated final class MacLink: NSObject, CBCentralManagerDelegate, CBPeriphera
         central?.stopScan()
         central?.connect(peripheral, options: nil)
         report("Connecting to your Mac…", connected: false)
+        startWatchdog(for: peripheral)
+    }
+
+    private func startWatchdog(for peripheral: CBPeripheral) {
+        handshakeWatchdog?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            // Only a shown pairing code (pendingKey) waits for the user; everything else should be quick.
+            guard let self, self.mac === peripheral, !self.authenticated, self.pendingKey == nil else { return }
+            self.report("No answer from your Mac. Retrying…", connected: false)
+            self.central?.cancelPeripheralConnection(peripheral)
+            // A connection that never opened may not report a disconnect: start over ourselves.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, self.mac === peripheral, peripheral.state != .connected else { return }
+                self.reset("Searching for your Mac…")
+            }
+        }
+        handshakeWatchdog = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: work)
+    }
+
+    /// The Mac answered (connected, or pairing in progress): no more timeout.
+    private func handshakeDone() {
+        handshakeWatchdog?.cancel()
+        handshakeWatchdog = nil
     }
 
     private func reset(_ message: String) {
+        handshakeDone()
         mac = nil
         command = nil
         buffer = Data()
@@ -236,6 +288,7 @@ nonisolated final class MacLink: NSObject, CBCentralManagerDelegate, CBPeriphera
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        guard mac == nil || mac === peripheral else { return }   // a late report about an old link
         reset(wantsConnection ? "Mac disconnected. Searching…" : "Disconnected")
     }
 
@@ -250,7 +303,14 @@ nonisolated final class MacLink: NSObject, CBCentralManagerDelegate, CBPeriphera
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        for characteristic in service.characteristics ?? [] {
+        let characteristics = service.characteristics ?? []
+        guard error == nil,
+              characteristics.contains(where: { $0.uuid == commandUUID }),
+              characteristics.contains(where: { $0.uuid == messageUUID }) else {
+            central?.cancelPeripheralConnection(peripheral)        // half-visible service: start over
+            return
+        }
+        for characteristic in characteristics {
             if characteristic.uuid == commandUUID {
                 command = characteristic
             } else if characteristic.uuid == messageUUID {
@@ -261,9 +321,20 @@ nonisolated final class MacLink: NSObject, CBCentralManagerDelegate, CBPeriphera
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
+        guard characteristic.uuid == messageUUID else { return }
+        // Subscribing failed (often a stale link after the Mac app restarted): reconnect fresh.
+        guard error == nil, characteristic.isNotifying else {
+            central?.cancelPeripheralConnection(peripheral)
+            return
+        }
         // Subscribed: introduce ourselves. The Mac answers with a challenge or "unpaired".
-        guard characteristic.uuid == messageUUID, characteristic.isNotifying else { return }
         _ = write("hello:\(watchID)")
+    }
+
+    /// The Mac app restarted and re-published its service: the old handles are gone.
+    func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+        guard invalidatedServices.contains(where: { $0.uuid == serviceUUID }) else { return }
+        central?.cancelPeripheralConnection(peripheral)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {

@@ -5,9 +5,13 @@
 //  Created by Reynard Amadeus  on 13/10/26.
 //
 //  • Turn the Digital Crown to move between errors.
-//  • Wrist flick (or the Open button) opens the selected error in Xcode.
-//  • Double tap your fingers (Series 9 / Ultra 2 and later), the Read button,
-//    or tapping the card reads the error aloud on the Mac via VoiceOver.
+//  • Double tap your fingers (Series 9 / Ultra 2 and later) or the Go button: Xcode jumps
+//    to the error's line, then VoiceOver on the Mac reads it with context
+//    ("Missing closing brace. Line 14, in func greet, inside struct Greeting…").
+//    With no errors, the Mac says "No errors yet".
+//  • Tapping the card or the Read button: hear the error without moving the cursor.
+//  • Wrist flick: same as Go.
+//  The watch itself never speaks (it would overlap with VoiceOver on the Mac).
 //
 
 import Combine
@@ -20,7 +24,6 @@ struct ContentView: View {
     @AppStorage("keepRunning") private var keepRunning = true
     @AppStorage("flickEnabled") private var flickEnabled = true
     @AppStorage("flickThreshold") private var flickThreshold = 8.0
-    @AppStorage("speakErrors") private var speakErrors = true
     @Environment(\.scenePhase) private var scenePhase
     @State private var crown = 0.0
     @State private var showSettings = false
@@ -28,37 +31,52 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 6) {
+                if bridge.snapshot.paused, bridge.pairingCode == nil {
+                    Label("Project closed in Xcode: paused", systemImage: "pause.circle")
+                        .font(.footnote).foregroundStyle(.orange)
+                        .accessibilityLabel("Paused. The project is closed in Xcode. Double tap to open it.")
+                }
                 if let code = bridge.pairingCode {
                     pairingView(code)
+                    findMacButton          // the Mac didn't show the code? start over
                 } else if !bridge.hasLoaded {
                     ProgressView()
                     Text(bridge.status).font(.footnote).multilineTextAlignment(.center)
+                    findMacButton
                 } else if let error = bridge.selected {
                     errorCard(error)
                     HStack {
                         Button {
-                            bridge.openSelected()
+                            bridge.goToSelected()
                         } label: {
-                            Label("Open", systemImage: "arrow.up.forward.app")
+                            Label("Go", systemImage: "arrow.right.to.line")
                         }
-                        .accessibilityLabel("Open in Xcode")
-                        .accessibilityHint("Or flick your wrist")
+                        .handGestureShortcut(.primaryAction)   // double tap (finger pinch)
+                        .accessibilityLabel("Go to error line in Xcode")
+                        .accessibilityHint("Or double tap your fingers. Your Mac reads the error after the jump")
 
                         Button {
-                            bridge.speakSelectedOnMac()
+                            bridge.readOnMac()
                         } label: {
                             Label("Read", systemImage: "speaker.wave.2")
                         }
-                        .handGestureShortcut(.primaryAction)   // double tap (finger pinch)
                         .accessibilityLabel("Read error on Mac")
-                        .accessibilityHint("Or double tap your fingers")
+                        .accessibilityHint("Reads it without moving the cursor")
                     }
                     if !bridge.isConnected {
                         Text(bridge.status).font(.footnote).foregroundStyle(.orange)
+                        findMacButton
                     }
                 } else {
-                    Label("No syntax errors", systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+                    Button {
+                        bridge.readOnMac()              // the Mac says "No errors yet"
+                    } label: {
+                        Label("No errors", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                    .buttonStyle(.plain)
+                    .handGestureShortcut(.primaryAction)   // double tap works here too
+                    .accessibilityHint("Double tap your fingers to hear it on your Mac")
                     Text(bridge.status).font(.footnote).foregroundStyle(.secondary)
                 }
             }
@@ -77,8 +95,7 @@ struct ContentView: View {
         .onChange(of: crown) { _, value in
             let index = Int(value.rounded())
             if index != bridge.selectedIndex {
-                bridge.selectedIndex = index
-                bridge.readSelected()          // turning the crown reads the new error
+                bridge.selectedIndex = index   // crown detents tick; nothing is spoken here
             }
         }
         .onChange(of: bridge.selectedIndex) { _, index in
@@ -110,10 +127,19 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .onTapGesture { bridge.speakSelectedOnMac() }   // same as double tap
+        .onTapGesture { bridge.readOnMac() }   // read only (double tap = go to the line)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Error \(bridge.selectedIndex + 1) of \(bridge.errors.count). \(error.spokenSummary)"
                             + (error.kind == .needsBuild ? ". Press Command B to re-check." : ""))
+    }
+
+    /// Starts the search for the Mac over (e.g. the Mac never showed the pairing code).
+    private var findMacButton: some View {
+        Button {
+            bridge.rediscover()
+        } label: {
+            Label("Find my Mac again", systemImage: "arrow.clockwise")
+        }
     }
 
     /// Shown (not spoken) while pairing, so people nearby can't hear the code.
@@ -132,15 +158,16 @@ struct ContentView: View {
 
     private var settings: some View {
         List {
+            Button("Find my Mac again") {
+                bridge.rediscover()
+                showSettings = false
+            }
             Button("Forget this Mac", role: .destructive) {
                 bridge.forgetMac()
                 showSettings = false
             }
             Toggle("Keep app running", isOn: $keepRunning)
             Text("Uses a workout session so the app stays alive and a wrist flick can't close it. \(workout.status).")
-                .font(.footnote).foregroundStyle(.secondary)
-            Toggle("Speak errors aloud", isOn: $speakErrors)
-            Text("When VoiceOver is on, VoiceOver reads them instead.")
                 .font(.footnote).foregroundStyle(.secondary)
             Toggle("Wrist flick opens error", isOn: $flickEnabled)
             VStack(alignment: .leading) {
